@@ -1,0 +1,7 @@
+websocket_client~=1.7.0
+pycryptodome~=3.20
+qrcode[pil]~=7.4
+httpx~=0.27.0
+
+# numpy==1.18.1
+# wsaccel==0.6.2

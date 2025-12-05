@@ -1,148 +1,256 @@
-import base64, json, threading, time, inquirer, httpx, qrcode, websocket, os
+from websocket import (
+    WebSocketApp,
+    WebSocketConnectionClosedException as ClosedEx,
+    WebSocket,
+)
+from base64 import (
+    b64encode as b64e,
+    b64decode as b64d,
+    urlsafe_b64encode as url_b64e,
+)
 from Crypto.Cipher import PKCS1_OAEP
-from Crypto.Hash import SHA256
+from rich.console import Console
 from Crypto.PublicKey import RSA
+from typing import Protocol, Any
+from rich.syntax import Syntax
+from Crypto.Hash import SHA256
+from json import dumps, loads
+from time import sleep, time
+from threading import Thread
+from functools import wraps
+from qrcode import make
+from httpx import post
+from os import getenv
 
-DEBUG = bool(os.getenv('PY_DEBUG', False))
 
-class Messages:
-    HEARTBEAT = 'heartbeat'
-    HELLO = 'hello'
-    INIT = 'init'
-    NONCE_PROOF = 'nonce_proof'
-    PENDING_REMOTE_INIT = 'pending_remote_init'
-    PENDING_TICKET = 'pending_ticket'
-    PENDING_LOGIN = 'pending_login'
+class CustomLogger:
+    @staticmethod
+    def fmt_json(data, type=None):
+        syntax = Syntax(
+            dumps(data, indent=4), "json", theme="monokai", line_numbers=False
+        )
+        console = Console()
+        if type:
+            print(f"[{type}]")
+        console.print(syntax)
+
+    @staticmethod
+    def send_header(centered_text: str):
+        print("-" * 22, f"| {centered_text.center(18)} |", "-" * 22, sep="\n")
 
 
 class DiscordUser:
     def __init__(self, values: dict[str, str]):
-        self.id = values.get('id')
-        self.username = values.get('username')
-        self.discrim = values.get('discrim')
-        self.avatar_hash = values.get('avatar_hash')
-        self.token = values.get('token')
+        self.id = values.get("id")
+        self.username = values.get("username")
+        self.avatar_hash = values.get("avatar_hash")
+        self.token = values.get("token")
 
-    @classmethod
-    def from_payload(cls, payload: str):
-        return cls(dict(zip(('id', 'discrim', 'avatar_hash', 'username'), payload.split(':'))))
+    def initalize(self, payload: str):
+        self.id, self.discrim, self.avatar_hash, self.username = payload.split(":")
 
     def pretty_print(self):
-        out = ''
-        out += f'User:            {self.username} ({self.id})\n'
-        out += f'Avatar URL:      https://cdn.discordapp.com/avatars/{self.id}/{self.avatar_hash}.png\n'
-        out += f'Token (SECRET!): {self.token}\n'
-
+        out = "\n"
+        out += "==== Discord User Info ====\n"
+        out += f"User:              {self.username} ({self.id})\n"
+        out += f"Avatar URL:        https://cdn.discordapp.com/avatars/{self.id}/{self.avatar_hash}.png\n"
+        out += f"Token (SECRET!):   {self.token}\n"
+        out += "===========================\n"
         return out
 
 
-class DiscordAuthWebsocket:
-    WS_ENDPOINT = 'wss://remote-auth-gateway.discord.gg/?v=2'
-    LOGIN_ENDPOINT = 'https://discord.com/api/v9/users/@me/remote-auth/login'
-
-    def __init__(self, debug=False):
-        self.debug = debug
-        self.ws = websocket.WebSocketApp(self.WS_ENDPOINT,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close,
-            header={'Origin': 'https://discord.com'})
-
+class DiscordAuth:
+    def __init__(self):
         self.key = RSA.generate(2048)
         self.cipher = PKCS1_OAEP.new(self.key, hashAlgo=SHA256)
 
-        self.heartbeat_interval = self.last_heartbeat = self.qr_image = self.user = None
+    @staticmethod
+    def exchange_ticket(ticket):
+        req = post(
+            "https://discord.com/api/v9/users/@me/remote-auth/login",
+            json={"ticket": ticket},
+        )
+        if not req.status_code == 200:
+            return None
+        return req.json().get("encrypted_token")
 
     @property
     def public_key(self):
-        return ''.join(self.key.publickey().export_key().decode('utf-8').split('\n')[1:-1])
+        pub_key = self.key.publickey()
+        return "".join(pub_key.export_key().decode("utf-8").split("\n")[1:-1])
 
-    def heartbeat_sender(self):
+    def encrypt(self, message: str, decode=True) -> str | bytes:
+        encrypted = self.cipher.encrypt(message.encode())
+        encoded = b64e(encrypted)
+        return encoded.decode() if decode else encoded
+
+    def decrypt(self, encrypted_message: str, decode=True) -> str | bytes:
+        decoded = b64d(encrypted_message)
+        decrypted = self.cipher.decrypt(decoded)
+        return decrypted.decode() if decode else decrypted
+
+
+class HeartbeatManager:
+    def __init__(self, ws: DiscordAuthWebsocket, interval: int):
+        self.ws = ws
+        self.interval = interval
+        self.last = time()
+
+    def handler(self):
         while True:
-            time.sleep(0.5)  # we don't need perfect accuracy
+            sleep(0.5)
 
-            current_time = time.time()
-            time_passed = current_time - self.last_heartbeat + 1  # add a second to be on the safe side
-            if time_passed >= self.heartbeat_interval:
-                try: self.send(Messages.HEARTBEAT)
-                except websocket.WebSocketConnectionClosedException: return
-                self.last_heartbeat = current_time
+            current_time = time()
+            time_passed = current_time - self.last + 1
+            if time_passed >= 30:
+                try:
+                    self.ws.send("heartbeat")
+                except ClosedEx:
+                    return
+                self.last = current_time
 
-    def run(self): self.ws.run_forever()
+    def start(self):
+        thread = Thread(target=self.handler)
+        thread.daemon = True
+        thread.start()
 
-    def send(self, op, data=None):
-        payload = {'op': op}
-        if data is not None: payload.update(**data)
-        if self.debug: print(f'Send: {payload}')
-        self.ws.send(json.dumps(payload))
 
-    def exchange_ticket(self, ticket):
-        print(f'Exch ticket: {ticket}')
-        r = httpx.post(self.LOGIN_ENDPOINT, json={'ticket': ticket})
-        if not r.status_code == 200: return None
-        return r.json().get('encrypted_token')
+class DiscordQRCode:
+    def __init__(self):
+        self.img = None
 
-    def decrypt_payload(self, encrypted_payload): return self.cipher.decrypt(base64.b64decode(encrypted_payload))
+    def generate(self, fingerprint: str):
+        self.img = make(f"https://discordapp.com/ra/{fingerprint}")
+        self.img.show(title="Discord QR Code")
 
-    def generate_qr_code(self, fingerprint):
-        self.qr_image = img = qrcode.make(f'https://discordapp.com/ra/{fingerprint}')
-        img.show(title='Discord QR Code')
 
-    def on_open(self, ws): pass
+class DiscordAuthWebsocket(WebSocketApp):
+    def __init__(self, debug: bool = False):
+        super().__init__(
+            "wss://remote-auth-gateway.discord.gg/?v=2",
+            header={"Origin": "https://discord.com"},
+            on_close=self.on_close,
+            on_open=self.on_open,
+            on_message=self.on_message,
+            on_error=self.on_error,
+        )
 
-    def on_message(self, ws, message):
-        if self.debug: print(f'Recv: {message}')
-        data = json.loads(message)
-        op = data.get('op')
-        match op:
-            case Messages.HELLO:
-                print('Attempting server handshake...')
+        self.handlers: dict[str, HandlerProtocol] = {}
+        self.debug = debug
+        self.heart_mgr = HeartbeatManager(self, 41250)
 
-                self.heartbeat_interval = data.get('heartbeat_interval') / 1000
-                self.last_heartbeat = time.time()
+        self.auth = DiscordAuth()
+        self.qr = DiscordQRCode()
+        self.user = DiscordUser({})
 
-                thread = threading.Thread(target=self.heartbeat_sender)
-                thread.daemon = True
-                thread.start()
+    def add_condition(self, op: str):
+        def decorator(func: HandlerProtocol):
+            if self.debug: print(f"[DEBUG] Registering handler for operation: {op}")
+            self.handlers.update({f"{op}": func()})
 
-                self.send(Messages.INIT, {'encoded_public_key': self.public_key})
-            case Messages.NONCE_PROOF:
-                self.send(
-                    Messages.NONCE_PROOF,
-                    {
-                        'proof': base64.urlsafe_b64encode(
-                            SHA256.new(data=self.decrypt_payload(data.get('encrypted_nonce'))).digest()
-                        ).decode().rstrip('=')
-                    }
+            @wraps(func)
+            def wrapper(*args, **kwargs):
+                if self.debug: print(f"[DEBUG] Handling operation: {op}")
+                return func(*args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+    def cus_send(self, op: str, data=None):
+        payload = {"op": op}
+        if data is not None:
+            payload.update(**data)
+        self.send(dumps(payload))
+        if self.debug:
+            CustomLogger.fmt_json(payload, type="Send")
+
+    def on_open(self, *args, **kwargs):
+        CustomLogger.send_header("Connection opened")
+
+    def on_close(self, *args, **kwargs):
+        CustomLogger.send_header("Connection closed")
+
+    def on_message(self, ws: WebSocket, message, *args, **kwargs):
+        payload: dict = loads(message)
+        if self.debug:
+            CustomLogger.fmt_json(payload, type="Recv")
+        self.handlers[payload["op"]](self, payload)
+
+    def on_error(self, ws: WebSocket, *args, **kwargs):
+        if isinstance(args[0], KeyboardInterrupt):
+            return
+        CustomLogger.send_header("An error occurred")
+        print(*args)
+
+
+class HandlerProtocol(Protocol):
+    def __call__(self, ws: DiscordAuthWebsocket, payload: dict) -> Any:
+        """
+        Docstring for __call__
+
+        :param self: The instance of the class
+        :param ws: The WebSocketApp instance
+        :type ws: DiscordAuthWebsocket
+        :param payload: The payload received from the WebSocket
+        :type payload: dict
+        :return: Any
+        :rtype: Any
+        """
+        pass
+
+
+AuthWebsocket = DiscordAuthWebsocket(debug=bool(getenv("PY_DEBUG", False)))
+
+
+@AuthWebsocket.add_condition("hello")
+class HelloHandler(HandlerProtocol):
+    def __call__(self, ws, payload):
+        ws.heart_mgr.start()
+
+        ws.cus_send("init", data={"encoded_public_key": ws.auth.public_key})
+
+
+@AuthWebsocket.add_condition("nonce_proof")
+class NonceProofHandler(HandlerProtocol):
+    def __call__(self, ws, payload):
+        ws.cus_send(
+            "nonce_proof",
+            data={
+                "proof": url_b64e(
+                    SHA256.new(
+                        data=ws.auth.decrypt(
+                            payload.get("encrypted_nonce"), decode=False
+                        )
+                    ).digest()
                 )
-            case Messages.PENDING_REMOTE_INIT:
-                self.generate_qr_code(data.get('fingerprint'))
-            case Messages.PENDING_TICKET:
-                self.user = DiscordUser.from_payload(self.decrypt_payload(data.get('encrypted_user_payload')).decode())
-            case Messages.PENDING_LOGIN:
-                if self.qr_image is not None: self.qr_image.close()
-                self.user.token = self.decrypt_payload(self.exchange_ticket(data.get('ticket'))).decode()
-                out = ''
-                out += f'User:            {self.user.username} ({self.user.id})\n'
-                out += f'Avatar URL:      https://cdn.discordapp.com/avatars/{self.user.id}/{self.user.avatar_hash}.png\n'
-                out += f'Token (SECRET!): {self.user.token}\n'
-                print(out)
-                self.ws.close()
-
-    def on_error(self, ws, error): print(error)
-
-    def on_close(self, *args, **kwargs): print('-' * 22, f'Connection closed', '-' * 22, sep="\n")
+                .decode()
+                .rstrip("=")
+            },
+        )
 
 
-if __name__ == '__main__':
-    auth_ws = DiscordAuthWebsocket(debug=DEBUG)
-    auth_ws.run()
+@AuthWebsocket.add_condition("pending_remote_init")
+class PendingRemoteInitHandler(HandlerProtocol):
+    def __call__(self, ws, payload):
+        ws.qr.generate(payload.get("fingerprint"))
 
-    answer = inquirer.prompt([
-        inquirer.Confirm('save', message='Save to info.txt?')
-    ])
 
-    if answer['save']:
-        open('info.txt', 'w+').write(auth_ws.user.pretty_print())
-        print('Saved.')
+@AuthWebsocket.add_condition("pending_ticket")
+class PendingTicketHandler(HandlerProtocol):
+    def __call__(self, ws, payload):
+        ws.user.initalize(ws.auth.decrypt(payload.get("encrypted_user_payload")))
+
+
+@AuthWebsocket.add_condition("pending_login")
+class PendingLoginHandler(HandlerProtocol):
+    def __call__(self, ws, payload):
+        0 if ws.qr is None else ws.qr.img.close()
+        ticket_exchange = DiscordAuth.exchange_ticket(payload.get("ticket"))
+        ws.user.token = ws.auth.decrypt(ticket_exchange)
+        print(ws.user.pretty_print())
+        ws.close()
+
+
+if __name__ == "__main__":
+    AuthWebsocket.run_forever()
